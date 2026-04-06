@@ -119,7 +119,6 @@ $script:leftBindKey = 0
 $script:rightBindKey = 0
 $script:leftEnabled = $false
 $script:rightEnabled = $false
-$script:hideKey = 0x11
 $script:leftCPS = 12
 $script:rightCPS = 12
 $script:rand = New-Object System.Random
@@ -140,7 +139,7 @@ $script:keyMap = @{
     'S' = 0x53; 'T' = 0x54; 'U' = 0x55; 'V' = 0x56; 'W' = 0x57; 'X' = 0x58
     'Y' = 0x59; 'Z' = 0x5A; 'D0' = 0x30; 'D1' = 0x31; 'D2' = 0x32; 'D3' = 0x33
     'D4' = 0x34; 'D5' = 0x35; 'D6' = 0x36; 'D7' = 0x37; 'D8' = 0x38; 'D9' = 0x39
-    'Space' = 0x20; 'Shift' = 0x10; 'Control' = 0x11; 'Alt' = 0x12
+    'Space' = 0x20; 'Shift' = 0x10; 'Alt' = 0x12
 }
 
 # --- UI ---
@@ -320,29 +319,20 @@ $mainTimer.Add_Tick({
          $script:rp = $isR
      }
 
-    $ish = [GlobalHotkey]::IsKeyPressed($script:hideKey)
-    if ($ish -and -not $script:hp) {
-        $script:isStealth = -not $script:isStealth
-        if ($script:isStealth) { $form.Hide() } else { $form.Show() }
-    }
-    $script:hp = $ish
-
     $lS = if ($script:leftEnabled) { "ON" } else { "OFF" }
     $rS = if ($script:rightEnabled) { "ON" } else { "OFF" }
     $labelStatus.Text = "STATUS: L: $lS | R: $rS"
     $labelStatus.ForeColor = if ($script:leftEnabled -or $script:rightEnabled) { [System.Drawing.Color]::Lime } else { [System.Drawing.Color]::Gray }
 
       if ($focused -and -not $menu) {
-          # LEFT MOUSE: Quando enabled e il vero tasto è premuto
+          # LEFT MOUSE
           $leftPhysicalPressed = [GlobalHotkey]::IsKeyPressed(0x01)
           if ($script:leftEnabled -and $leftPhysicalPressed) {
-              # Se non è ancora stato simulato il DOWN, fai DOWN
               if (-not $script:leftMouseDown) {
                   [InputSimulator]::LeftMouseDown()
                   $script:leftMouseDown = $true
                   $script:nextL = $now + (Soda-Click-Delay $script:leftCPS)
               }
-              # Se è passato il delay, fai un altro ciclo (tenga premuto = click continui)
               elseif ($now -ge $script:nextL) {
                   [InputSimulator]::LeftMouseUp()
                   Start-Sleep -Milliseconds 5
@@ -354,23 +344,20 @@ $mainTimer.Add_Tick({
                   $script:nextL = $now + (Soda-Click-Delay $script:leftCPS)
               }
           } else {
-              # Se non è premuto ma abbiamo il DOWN attivo, fai UP
               if ($script:leftMouseDown) {
                   [InputSimulator]::LeftMouseUp()
                   $script:leftMouseDown = $false
               }
           }
 
-          # RIGHT MOUSE: Quando enabled e il vero tasto è premuto
+          # RIGHT MOUSE
           $rightPhysicalPressed = [GlobalHotkey]::IsKeyPressed(0x02)
           if ($script:rightEnabled -and $rightPhysicalPressed) {
-              # Se non è ancora stato simulato il DOWN, fai DOWN
               if (-not $script:rightMouseDown) {
                   [InputSimulator]::RightMouseDown()
                   $script:rightMouseDown = $true
                   $script:nextR = $now + (Soda-Click-Delay $script:rightCPS)
               }
-              # Se è passato il delay, fai un altro ciclo (tenga premuto = click continui)
               elseif ($now -ge $script:nextR) {
                   [InputSimulator]::RightMouseUp()
                   Start-Sleep -Milliseconds 5
@@ -378,7 +365,6 @@ $mainTimer.Add_Tick({
                   $script:nextR = $now + (Soda-Click-Delay $script:rightCPS)
               }
           } else {
-              # Se non è premuto ma abbiamo il DOWN attivo, fai UP
               if ($script:rightMouseDown) {
                   [InputSimulator]::RightMouseUp()
                   $script:rightMouseDown = $false
