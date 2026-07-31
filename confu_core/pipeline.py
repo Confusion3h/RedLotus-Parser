@@ -143,6 +143,9 @@ class ConfuV1Pipeline:
                 pass
         except KeyboardInterrupt:
             logger.info("Live transcription interrupted by user")
+        except RuntimeError:
+            # Surface mic/backend errors to the caller (CLI handles messaging)
+            raise
 
         # Persist mapping once at the end
         self.pii.save_mapping()

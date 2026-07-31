@@ -108,8 +108,16 @@ def test_file_pipeline() -> None:
 
 
 def test_live_microphone(duration: float = 10.0) -> None:
-    """Live mic test (~10s). Skipped gracefully if no capture device."""
+    """Live mic test (~10s). Skipped gracefully if no capture device/backend."""
     logger.info("=== TEST: start_live_transcription (%.0fs) ===", duration)
+
+    from stt.engine import STTEngine
+
+    try:
+        STTEngine._select_audio_backend()
+    except RuntimeError as exc:
+        logger.warning("%s — skipping live test", exc)
+        return
 
     # Probe for an input device before starting
     has_device = False
@@ -123,7 +131,10 @@ def test_live_microphone(duration: float = 10.0) -> None:
             import pyaudio
 
             pa = pyaudio.PyAudio()
-            has_device = pa.get_device_count() > 0
+            has_device = any(
+                pa.get_device_info_by_index(i).get("maxInputChannels", 0) > 0
+                for i in range(pa.get_device_count())
+            )
             pa.terminate()
         except Exception as exc:
             logger.warning("No audio backend available (%s) — skipping live test", exc)
@@ -140,12 +151,21 @@ def test_live_microphone(duration: float = 10.0) -> None:
         def on_partial(raw: str, anon: str) -> None:
             logger.info("chunk raw=%r anon=%r", raw, anon)
 
-        result = pipeline.start_live_transcription(
-            duration_seconds=duration,
-            on_partial=on_partial,
-        )
+        try:
+            result = pipeline.start_live_transcription(
+                duration_seconds=duration,
+                on_partial=on_partial,
+            )
+        except RuntimeError as exc:
+            logger.warning("Live capture failed (%s) — skipping", exc)
+            return
+
         assert result.source == "live"
-        logger.info("Live transcript (%d chars): %s", len(result.raw_transcript), result.raw_transcript[:200])
+        logger.info(
+            "Live transcript (%d chars): %s",
+            len(result.raw_transcript),
+            result.raw_transcript[:200],
+        )
         logger.info("PASS: start_live_transcription")
 
 

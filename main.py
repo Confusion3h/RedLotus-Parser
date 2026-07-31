@@ -57,7 +57,11 @@ def cmd_file(args: argparse.Namespace) -> int:
         mapping_path=args.mapping,
         riva_uri=args.riva_uri,
     )
-    result = pipeline.process_audio_file(args.audio_path)
+    try:
+        result = pipeline.process_audio_file(args.audio_path)
+    except FileNotFoundError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
     _print_result(result, show_raw=args.show_raw)
     return 0
 
@@ -73,10 +77,14 @@ def cmd_live(args: argparse.Namespace) -> int:
         print(f"  [chunk] raw={raw!r}")
         print(f"          anon={anon!r}")
 
-    result = pipeline.start_live_transcription(
-        duration_seconds=args.duration,
-        on_partial=on_partial if args.verbose else None,
-    )
+    try:
+        result = pipeline.start_live_transcription(
+            duration_seconds=args.duration,
+            on_partial=on_partial if args.verbose else None,
+        )
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
     _print_result(result, show_raw=args.show_raw)
     return 0
 
@@ -103,39 +111,52 @@ def cmd_rehydrate(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="confu",
-        description="Confu V1.0 — Local STT + Italian PII Anonymizer",
+    shared = argparse.ArgumentParser(add_help=False)
+    shared.add_argument(
+        "-v", "--verbose", action="store_true", help="Debug logging / live chunk prints"
     )
-    parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
-    parser.add_argument(
+    shared.add_argument(
         "--model",
         default="medium",
         help="faster-whisper model size (tiny|base|small|medium|large-v3|large-v3-turbo)",
     )
-    parser.add_argument(
+    shared.add_argument(
         "--mapping",
         default="mapping_dict.json",
         help="Path to volatile local mapping JSON",
     )
-    parser.add_argument(
+    shared.add_argument(
         "--riva-uri",
         default=None,
         help="Optional NVIDIA Riva gRPC endpoint (e.g. localhost:50051)",
     )
-    parser.add_argument(
+    shared.add_argument(
         "--show-raw",
         action="store_true",
         help="Also print the uncensored raw transcript (local only)",
     )
 
+    parser = argparse.ArgumentParser(
+        prog="confu",
+        description="Confu V1.0 — Local STT + Italian PII Anonymizer",
+        parents=[shared],
+    )
+
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_file = sub.add_parser("file", help="Batch: transcribe + anonymize an audio file")
+    p_file = sub.add_parser(
+        "file",
+        parents=[shared],
+        help="Batch: transcribe + anonymize an audio file",
+    )
     p_file.add_argument("audio_path", help="Path to .mp3 / .wav / .m4a")
     p_file.set_defaults(func=cmd_file)
 
-    p_live = sub.add_parser("live", help="Live: microphone STT + anonymize")
+    p_live = sub.add_parser(
+        "live",
+        parents=[shared],
+        help="Live: microphone STT + anonymize",
+    )
     p_live.add_argument(
         "--duration",
         type=float,
@@ -144,7 +165,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_live.set_defaults(func=cmd_live)
 
-    p_reh = sub.add_parser("rehydrate", help="Restore PII from placeholders via mapping")
+    p_reh = sub.add_parser(
+        "rehydrate",
+        parents=[shared],
+        help="Restore PII from placeholders via mapping",
+    )
     p_reh.add_argument("text", help="Anonymized text containing [PLACEHOLDER_N] tokens")
     p_reh.set_defaults(func=cmd_rehydrate)
 

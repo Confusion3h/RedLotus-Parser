@@ -10,9 +10,9 @@ import logging
 import queue
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Generator, Iterator, Optional
+from typing import Callable, Generator, Optional
 
 import numpy as np
 
@@ -181,6 +181,28 @@ class STTEngine:
         return " ".join(parts)
 
     # ----------------------------------------------------------- live mic
+    @staticmethod
+    def _select_audio_backend() -> str:
+        """Return 'sounddevice' or 'pyaudio', or raise with actionable details."""
+        errors: list[str] = []
+        try:
+            import sounddevice  # noqa: F401
+
+            return "sounddevice"
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"sounddevice unavailable ({exc})")
+        try:
+            import pyaudio  # noqa: F401
+
+            return "pyaudio"
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"pyaudio unavailable ({exc})")
+        raise RuntimeError(
+            "Live microphone requires a working audio backend "
+            "(sounddevice+PortAudio or pyaudio). "
+            + " ".join(errors)
+        )
+
     def stream_microphone(
         self,
         duration_seconds: Optional[float] = None,
@@ -192,75 +214,108 @@ class STTEngine:
         Uses sounddevice when available, otherwise PyAudio.
         If ``duration_seconds`` is set, stops after that many seconds.
         """
+        backend_name = self._select_audio_backend()
         audio_q: queue.Queue[Optional[np.ndarray]] = queue.Queue()
         stop_event = threading.Event()
+        error_box: list[BaseException] = []
         started = time.monotonic()
 
         def _producer_sounddevice() -> None:
-            import sounddevice as sd
+            try:
+                import sounddevice as sd
 
-            blocksize = int(self.config.sample_rate * self.config.chunk_seconds)
+                blocksize = int(self.config.sample_rate * self.config.chunk_seconds)
 
-            def callback(indata, frames, time_info, status):  # noqa: ARG001
-                if status:
-                    logger.debug("sounddevice status: %s", status)
-                audio_q.put(indata.copy().reshape(-1).astype(np.float32))
+                def callback(indata, frames, time_info, status):  # noqa: ARG001
+                    if status:
+                        logger.debug("sounddevice status: %s", status)
+                    audio_q.put(indata.copy().reshape(-1).astype(np.float32))
 
-            with sd.InputStream(
-                samplerate=self.config.sample_rate,
-                channels=CHANNELS,
-                dtype="float32",
-                blocksize=blocksize,
-                callback=callback,
-            ):
-                while not stop_event.is_set():
-                    time.sleep(0.05)
+                with sd.InputStream(
+                    samplerate=self.config.sample_rate,
+                    channels=CHANNELS,
+                    dtype="float32",
+                    blocksize=blocksize,
+                    callback=callback,
+                ):
+                    while not stop_event.is_set():
+                        time.sleep(0.05)
+            except BaseException as exc:  # noqa: BLE001
+                error_box.append(exc)
+                audio_q.put(None)
 
         def _producer_pyaudio() -> None:
-            import pyaudio
-
-            pa = pyaudio.PyAudio()
-            frames_per_buffer = int(self.config.sample_rate * self.config.chunk_seconds)
-            stream = pa.open(
-                format=pyaudio.paInt16,
-                channels=CHANNELS,
-                rate=self.config.sample_rate,
-                input=True,
-                frames_per_buffer=frames_per_buffer,
-            )
+            pa = None
+            stream = None
             try:
+                import pyaudio
+
+                pa = pyaudio.PyAudio()
+                frames_per_buffer = int(
+                    self.config.sample_rate * self.config.chunk_seconds
+                )
+                stream = pa.open(
+                    format=pyaudio.paInt16,
+                    channels=CHANNELS,
+                    rate=self.config.sample_rate,
+                    input=True,
+                    frames_per_buffer=frames_per_buffer,
+                )
                 while not stop_event.is_set():
                     raw = stream.read(frames_per_buffer, exception_on_overflow=False)
                     audio = (
                         np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
                     )
                     audio_q.put(audio)
+            except BaseException as exc:  # noqa: BLE001
+                error_box.append(exc)
+                audio_q.put(None)
             finally:
-                stream.stop_stream()
-                stream.close()
-                pa.terminate()
+                if stream is not None:
+                    try:
+                        stream.stop_stream()
+                        stream.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                if pa is not None:
+                    try:
+                        pa.terminate()
+                    except Exception:  # noqa: BLE001
+                        pass
 
-        backend_name = "sounddevice"
-        try:
-            import sounddevice  # noqa: F401
-            producer = threading.Thread(target=_producer_sounddevice, daemon=True)
-        except Exception:
-            backend_name = "pyaudio"
-            producer = threading.Thread(target=_producer_pyaudio, daemon=True)
+        target = (
+            _producer_sounddevice if backend_name == "sounddevice" else _producer_pyaudio
+        )
+        producer = threading.Thread(target=target, daemon=True)
 
-        logger.info("Live mic capture via %s (chunk=%.1fs)", backend_name, self.config.chunk_seconds)
+        logger.info(
+            "Live mic capture via %s (chunk=%.1fs)",
+            backend_name,
+            self.config.chunk_seconds,
+        )
         producer.start()
 
         chunk_idx = 0
         try:
             while True:
-                if duration_seconds is not None and (time.monotonic() - started) >= duration_seconds:
+                if error_box:
+                    raise RuntimeError(
+                        f"Microphone capture failed ({backend_name}): {error_box[0]}"
+                    ) from error_box[0]
+                if (
+                    duration_seconds is not None
+                    and (time.monotonic() - started) >= duration_seconds
+                ):
                     break
                 try:
                     audio = audio_q.get(timeout=0.5)
                 except queue.Empty:
                     continue
                 if audio is None:
+                    if error_box:
+                        raise RuntimeError(
+                            f"Microphone capture failed ({backend_name}): {error_box[0]}"
+                        ) from error_box[0]
                     break
 
                 text = self._transcribe_audio_array(audio)
