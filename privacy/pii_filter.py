@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -20,28 +21,52 @@ logger = logging.getLogger(__name__)
 DEFAULT_MODEL_ID = "rizzoaiacademy/rizzo-pii-0.3B"
 DEFAULT_MAPPING_PATH = Path("mapping_dict.json")
 
-# Codice Fiscale: 16 alphanumeric chars with month letter set
+# Optional separators often inserted by ASR / copy-paste between identifier chars
+_SEP = r"[\s\-\.]*"
+
+# Codice Fiscale: 16 alphanumeric chars with month letter set (seps allowed between chars)
+# Trailing lookahead allows a glued Italian IBAN that starts with IT.
+_CF_BODY = (
+    r"[A-Z]" + _SEP + r"[A-Z]" + _SEP + r"[A-Z]" + _SEP
+    + r"[A-Z]" + _SEP + r"[A-Z]" + _SEP + r"[A-Z]" + _SEP
+    + r"\d" + _SEP + r"\d" + _SEP
+    + r"[A-EHLMPRST]" + _SEP
+    + r"\d" + _SEP + r"\d" + _SEP
+    + r"[A-Z]" + _SEP
+    + r"\d" + _SEP + r"\d" + _SEP + r"\d" + _SEP
+    + r"[A-Z]"
+)
 _CF_RE = re.compile(
-    r"\b([A-Z]{6}\d{2}[A-EHLMPRST]\d{2}[A-Z]\d{3}[A-Z])\b",
+    rf"(?<![A-Z0-9])({_CF_BODY})(?=IT|(?![A-Z0-9]))",
     re.IGNORECASE,
 )
 
-# Italian IBAN: IT + 2 check digits + 1 CIN letter + 22 digits (spaces allowed anywhere)
-# Total 27 alphanumeric characters. Example: IT60X0542811101000000123456
+# Italian IBAN: IT + 2 check digits + 1 CIN letter + 22 digits (spaces/dashes/dots ok)
+# Leading lookbehind also allows an IBAN glued after a compact 16-char CF.
+_CF_LOOKBEHIND = (
+    r"(?<=[A-Za-z]{6}\d{2}[A-Ea-eHhLlMmPpRrSsTt]\d{2}[A-Za-z]\d{3}[A-Za-z])"
+)
 _IBAN_RE = re.compile(
-    r"\b(IT(?:\s*\d){2}\s*[A-Z](?:\s*\d){22})\b",
+    rf"(?:(?<![A-Z0-9])|{_CF_LOOKBEHIND})"
+    rf"(IT(?:{_SEP}\d){{2}}{_SEP}[A-Z](?:{_SEP}\d){{22}})(?![A-Z0-9])",
     re.IGNORECASE,
 )
 
 # Partita IVA: optional IT prefix + exactly 11 digits
-_PIVA_RE = re.compile(r"\b(IT\s*\d{11}|\d{11})\b", re.IGNORECASE)
+_PIVA_RE = re.compile(
+    rf"(?<![A-Z0-9])(IT{_SEP}\d(?:{_SEP}\d){{10}}|\d{{11}})(?![A-Z0-9])",
+    re.IGNORECASE,
+)
 
-# Italian phones: optional +39, mobile 3XX… or landline 0… ; no mid-digit matches
+# Italian phones: optional +39, mobile 3XX… or landline 0… ; dots/dashes/spaces allowed
 _PHONE_RE = re.compile(
-    r"(?<!\d)(\+39[\s\-]?)?(?:0\d{1,3}[\s\-]?\d{6,8}|3\d{2}[\s\-]?\d{6,7})(?!\d)"
+    r"(?<!\d)(\+39[\s\-\.]*)?(?:0\d{1,3}(?:[\s\-\.]*\d){6,8}|3\d{2}(?:[\s\-\.]*\d){6,7})(?!\d)"
 )
 
 _EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b")
+
+# Placeholder token used during rehydrate (single-pass)
+_PLACEHOLDER_RE = re.compile(r"\[[A-Z][A-Z0-9]*_\d+\]")
 
 # Map model label / regex kind → placeholder prefix
 LABEL_TO_PREFIX = {
@@ -81,12 +106,15 @@ def _digits_only(value: str) -> str:
     return re.sub(r"\D", "", value)
 
 
+def _alnum_only(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]", "", value)
+
+
 def _is_plausible_italian_phone(value: str) -> bool:
     """Reject mid-number / account-tail matches that only look phone-like."""
     digits = _digits_only(value)
     if digits.startswith("39") and len(digits) >= 11:
         digits = digits[2:]
-    # Italian national numbers are typically 9–11 digits
     if not (9 <= len(digits) <= 11):
         return False
     if digits.startswith("3"):
@@ -94,6 +122,16 @@ def _is_plausible_italian_phone(value: str) -> bool:
     if digits.startswith("0"):
         return True
     return False
+
+
+def _is_plausible_cf(value: str) -> bool:
+    compact = _alnum_only(value).upper()
+    return bool(re.fullmatch(r"[A-Z]{6}\d{2}[A-EHLMPRST]\d{2}[A-Z]\d{3}[A-Z]", compact))
+
+
+def _is_plausible_iban(value: str) -> bool:
+    compact = _alnum_only(value).upper()
+    return len(compact) == 27 and compact.startswith("IT") and compact[2:4].isdigit()
 
 
 class PIIFilter:
@@ -117,6 +155,7 @@ class PIIFilter:
         self._counters: dict[str, int] = {}
         self._pipeline = None
         self._backend = "regex"
+        self._lock = threading.RLock()
 
         if load_model:
             self._load_ner(device)
@@ -154,19 +193,25 @@ class PIIFilter:
             try:
                 data = json.loads(self.mapping_path.read_text(encoding="utf-8"))
                 if isinstance(data, dict):
-                    self.mapping.update({str(k): str(v) for k, v in data.items()})
-                    for key in self.mapping:
-                        body = key.strip("[]")
-                        if "_" not in body:
-                            continue
-                        prefix, idx_part = body.rsplit("_", 1)
-                        if idx_part.isdigit():
-                            self._counters[prefix] = max(
-                                self._counters.get(prefix, 0), int(idx_part) + 1
-                            )
+                    with self._lock:
+                        self.mapping.update({str(k): str(v) for k, v in data.items()})
+                        for key in self.mapping:
+                            body = key.strip("[]")
+                            if "_" not in body:
+                                continue
+                            prefix, idx_part = body.rsplit("_", 1)
+                            if idx_part.isdigit():
+                                self._counters[prefix] = max(
+                                    self._counters.get(prefix, 0), int(idx_part) + 1
+                                )
                     logger.info(
                         "Loaded %d mapping entries from %s",
                         len(self.mapping),
+                        self.mapping_path,
+                    )
+                else:
+                    logger.warning(
+                        "Mapping file %s is not a JSON object — ignoring",
                         self.mapping_path,
                     )
             except (json.JSONDecodeError, OSError) as exc:
@@ -174,18 +219,37 @@ class PIIFilter:
 
     def save_mapping(self, path: Optional[str | Path] = None) -> Path:
         """Persist the placeholder ↔ real-value map to a local JSON file."""
+        import os
+        import tempfile
+
         out = Path(path) if path else self.mapping_path
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(
-            json.dumps(self.mapping, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        logger.info("Saved mapping (%d entries) → %s", len(self.mapping), out)
+        with self._lock:
+            n = len(self.mapping)
+            payload = json.dumps(self.mapping, ensure_ascii=False, indent=2)
+            # Unique tmp per writer so concurrent saves cannot clobber each other
+            fd, tmp_name = tempfile.mkstemp(
+                prefix=out.name + ".",
+                suffix=".tmp",
+                dir=str(out.parent),
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(payload)
+                os.replace(tmp_name, out)
+            except Exception:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+                raise
+        logger.info("Saved mapping (%d entries) → %s", n, out)
         return out
 
     def clear_mapping(self, delete_file: bool = False) -> None:
-        self.mapping.clear()
-        self._counters.clear()
+        with self._lock:
+            self.mapping.clear()
+            self._counters.clear()
         if delete_file and self.mapping_path.exists():
             self.mapping_path.unlink()
 
@@ -197,12 +261,18 @@ class PIIFilter:
 
     def _reuse_or_create(self, prefix: str, value: str) -> str:
         """Reuse an existing placeholder for the same value (case-insensitive)."""
-        # Normalize IBAN/CF comparisons by stripping spaces
-        norm_value = re.sub(r"\s+", "", value).lower()
+        norm_value = _alnum_only(value).lower() if prefix in {"IBAN", "CF", "PIVA"} else re.sub(
+            r"\s+", "", value
+        ).lower()
         for ph, real in self.mapping.items():
             if not ph.startswith(f"[{prefix}_"):
                 continue
-            if re.sub(r"\s+", "", real).lower() == norm_value:
+            real_norm = (
+                _alnum_only(real).lower()
+                if prefix in {"IBAN", "CF", "PIVA"}
+                else re.sub(r"\s+", "", real).lower()
+            )
+            if real_norm == norm_value:
                 return ph
         ph = self._next_placeholder(prefix)
         self.mapping[ph] = value
@@ -232,7 +302,6 @@ class PIIFilter:
                 for ent in raw:
                     start = int(ent["start"])
                     end = int(ent["end"])
-                    # Prefer original slice so offsets stay consistent after strip
                     word = text[start:end]
                     entities.append(
                         {
@@ -267,12 +336,16 @@ class PIIFilter:
                 value = m.group(0)
                 if label == "PHONE" and not _is_plausible_italian_phone(value):
                     continue
+                if label == "CF" and not _is_plausible_cf(value):
+                    continue
+                if label == "IBAN" and not _is_plausible_iban(value):
+                    continue
                 if label == "PIVA":
-                    compact = re.sub(r"\s+", "", value).upper()
+                    compact = _alnum_only(value).upper()
                     digits = _digits_only(value)
-                    if compact.startswith("IT"):
+                    if compact.startswith("IT") and len(digits) == 11:
                         pass
-                    elif len(digits) == 11:
+                    elif len(digits) == 11 and not compact.startswith("IT"):
                         ctx = text[max(0, m.start() - 24) : m.start()].lower()
                         if not any(
                             k in ctx
@@ -280,10 +353,6 @@ class PIIFilter:
                         ):
                             continue
                     else:
-                        continue
-                if label == "IBAN":
-                    compact = re.sub(r"\s+", "", value).upper()
-                    if len(compact) != 27 or not compact.startswith("IT"):
                         continue
                 found.append(
                     {
@@ -332,21 +401,28 @@ class PIIFilter:
         Returns anonymized text + mapping snapshot + entity list.
         """
         if not text:
-            return AnonymizationResult(anonymized_text="", mapping=dict(self.mapping))
+            with self._lock:
+                return AnonymizationResult(
+                    anonymized_text="", mapping=dict(self.mapping)
+                )
 
         entities = self.detect_entities(text)
         anonymized = text
-        for ent in sorted(entities, key=lambda e: e["start"], reverse=True):
-            prefix = ent["label"]
-            placeholder = self._reuse_or_create(prefix, ent["text"])
-            anonymized = anonymized[: ent["start"]] + placeholder + anonymized[ent["end"] :]
+        with self._lock:
+            for ent in sorted(entities, key=lambda e: e["start"], reverse=True):
+                prefix = ent["label"]
+                placeholder = self._reuse_or_create(prefix, ent["text"])
+                anonymized = (
+                    anonymized[: ent["start"]] + placeholder + anonymized[ent["end"] :]
+                )
+            snapshot = dict(self.mapping)
 
         if persist:
             self.save_mapping()
 
         return AnonymizationResult(
             anonymized_text=anonymized,
-            mapping=dict(self.mapping),
+            mapping=snapshot,
             entities=entities,
         )
 
@@ -354,11 +430,34 @@ class PIIFilter:
     def rehydrate(
         self, anonymized_text: str, mapping: Optional[dict[str, str]] = None
     ) -> str:
-        """Replace placeholders with original values using the mapping dict."""
+        """
+        Replace placeholders with original values using the mapping dict.
+
+        Single-pass substitution so values that themselves contain
+        ``[PLACEHOLDER_N]`` text are not expanded again.
+        """
         mapping = mapping if mapping is not None else self.mapping
-        result = anonymized_text
-        for placeholder, real in sorted(
-            mapping.items(), key=lambda kv: len(kv[0]), reverse=True
-        ):
-            result = result.replace(placeholder, real)
-        return result
+        if not mapping:
+            return anonymized_text
+
+        def _sub(match: re.Match[str]) -> str:
+            token = match.group(0)
+            return mapping.get(token, token)
+
+        # Only replace known placeholders; ignore unknown [FOO_0] tokens
+        known = {k for k in mapping if _PLACEHOLDER_RE.fullmatch(k)}
+        if not known:
+            # Fall back to plain replace longest-first without rescanning values
+            result = anonymized_text
+            for placeholder, real in sorted(
+                mapping.items(), key=lambda kv: len(kv[0]), reverse=True
+            ):
+                # Split/join avoids replacing inside already-substituted segments
+                parts = result.split(placeholder)
+                result = real.join(parts)
+            return result
+
+        pattern = re.compile(
+            "|".join(re.escape(k) for k in sorted(known, key=len, reverse=True))
+        )
+        return pattern.sub(_sub, anonymized_text)

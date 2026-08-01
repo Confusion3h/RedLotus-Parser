@@ -126,6 +126,8 @@ class STTEngine:
         path = Path(audio_path)
         if not path.exists():
             raise FileNotFoundError(f"Audio file not found: {path}")
+        if not path.is_file():
+            raise ValueError(f"Audio path is not a file: {path}")
 
         if self._backend == "riva":
             return self._transcribe_file_riva(path)
