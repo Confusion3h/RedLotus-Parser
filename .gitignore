@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Confu runtime artifacts
+mapping_dict.json
+*.wav
+*.mp3
+*.m4a
+!tests/fixtures/**
+
+# Models / caches
+.cache/
+models/
+*.bin
+*.pt
+*.onnx
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
